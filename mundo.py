@@ -88,6 +88,7 @@ class Mundo:
         self.raid_posto_id: int | None = None
         self.cooldowns_postos: dict[int, float] = {}
         self.tiros_postos: list[dict] = []
+        self.eventos_visuais: list[dict] = []
         self.proximo_id = 1
         self.tempo_anim = 0.0
         self.versao_arvores = 0
@@ -2248,8 +2249,17 @@ class Mundo:
         self.soldados = vivos
 
     def _executar_ataque(self, soldado, alvo, dano: float) -> None:
+        alvo_x, alvo_y = alvo.x, alvo.y
         self._dano_inimigo(alvo, dano)
         classe = soldado.classe
+        self.eventos_visuais.append(
+            {
+                "classe": classe,
+                "base": BASE_TROPA.get(classe, "soldado"),
+                "x": alvo_x,
+                "y": alvo_y,
+            }
+        )
         if classe == "destruidor":
             for outro in [*self.inimigos, *self.errantes]:
                 if outro is alvo:
@@ -2287,6 +2297,14 @@ class Mundo:
                     )
             soldado.habilidade_timer = soldado.cooldown_max
             soldado.xp += 2.0
+            self.eventos_visuais.append(
+                {
+                    "classe": soldado.classe,
+                    "base": "curandeiro",
+                    "x": soldado.x,
+                    "y": soldado.y,
+                }
+            )
 
     def _atualizar_soldados(self, dt: float) -> None:
         if not self.soldados:

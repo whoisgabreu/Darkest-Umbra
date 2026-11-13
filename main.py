@@ -38,6 +38,7 @@ from mapa import (
 )
 from mundo import Mundo
 from persistencia import carregar_jogo, novo_jogo, salvar_jogo
+from visual import BancoAssets
 from reino import (
     CONSTRUCOES,
     CONSUMO_POR_PESSOA,
@@ -247,6 +248,15 @@ class Jogo(arcade.Window):
         arcade.set_background_color(COR_FUNDO)
 
         self.reino, self.mapa, self.mundo, camera_salva = self._carregar_ou_novo()
+        self.assets = BancoAssets()
+        self._cursor_custom = self.assets.ativo and self.assets.tem("cursor")
+        if self._cursor_custom:
+            self.set_mouse_visible(False)
+        self._efeitos: list[dict] = []
+        self._snapshot_entidades: dict[tuple[str, int], dict] = {}
+        self._banner_evento: tuple[str, float] | None = None
+        self._mercador_visto = self.reino.mercador_dias
+        self._fome_visto = self.reino.dias_sem_comida
         self.camera = Camera2D()
         if camera_salva is not None:
             self.camera.position = camera_salva
@@ -356,6 +366,11 @@ class Jogo(arcade.Window):
         self._terreno_chunks.clear()
         self._arvores_chunks.clear()
         self._rochas_chunks.clear()
+        self._efeitos.clear()
+        self._snapshot_entidades.clear()
+        self._banner_evento = None
+        self._mercador_visto = self.reino.mercador_dias
+        self._fome_visto = self.reino.dias_sem_comida
         self._centralizar()
         self._salvar()
         self._mostrar_toast(
@@ -422,7 +437,12 @@ class Jogo(arcade.Window):
     def on_update(self, delta_time: float) -> None:
         self._tempo_anim += delta_time
         self._mover_camera(delta_time)
+        self._capturar_snapshot()
         self.mundo.atualizar(delta_time)
+        self._processar_eventos_visuais()
+        self._processar_mortes()
+        self._atualizar_efeitos(delta_time)
+        self._atualizar_banner(delta_time)
 
         if self.mundo.chunks_arvores_dirty:
             for chunk in self.mundo.chunks_arvores_dirty:
@@ -450,6 +470,169 @@ class Jogo(arcade.Window):
 
         self._montar_botoes()
 
+    def _capturar_snapshot(self) -> None:
+        self._snapshot_entidades = {}
+        for cidadao in self.mundo.cidadaos:
+            self._snapshot_entidades[("cidadao", cidadao.id)] = {
+                "x": cidadao.x,
+                "y": cidadao.y,
+            }
+        for soldado in self.mundo.soldados:
+            self._snapshot_entidades[("soldado", soldado.id)] = {
+                "x": soldado.x,
+                "y": soldado.y,
+                "classe": soldado.classe,
+            }
+        for inimigo in self.mundo.inimigos:
+            self._snapshot_entidades[("inimigo", inimigo.id)] = {
+                "x": inimigo.x,
+                "y": inimigo.y,
+            }
+        for inimigo in self.mundo.errantes:
+            self._snapshot_entidades[("errante", inimigo.id)] = {
+                "x": inimigo.x,
+                "y": inimigo.y,
+            }
+
+    def _processar_eventos_visuais(self) -> None:
+        if not self.mundo.eventos_visuais:
+            return
+        for evento in self.mundo.eventos_visuais:
+            base = evento.get("base", "soldado")
+            if base == "arqueiro":
+                asset = "efeito_flecha"
+                escala = 1.0
+            elif base == "mago":
+                asset = "efeito_explosao"
+                escala = 0.55
+            elif base == "curandeiro":
+                asset = "efeito_faisca_upgrade"
+                escala = 0.7
+            else:
+                asset = "efeito_corte_espada"
+                escala = 0.75
+            self._adicionar_efeito(
+                asset,
+                evento.get("x", 0),
+                evento.get("y", 0),
+                escala=escala,
+                fps=12,
+            )
+        self.mundo.eventos_visuais.clear()
+
+    def _processar_mortes(self) -> None:
+        if not self._snapshot_entidades:
+            return
+        atuais = {("cidadao", c.id) for c in self.mundo.cidadaos}
+        atuais |= {("soldado", s.id) for s in self.mundo.soldados}
+        atuais |= {("inimigo", i.id) for i in self.mundo.inimigos}
+        atuais |= {("errante", i.id) for i in self.mundo.errantes}
+        for chave, dados in self._snapshot_entidades.items():
+            if chave in atuais:
+                continue
+            tipo = chave[0]
+            if tipo == "soldado":
+                asset = f"tropa_{dados.get('classe', 'soldado')}_morrer"
+                ancora = "centro"
+                escala = 1.0
+            elif tipo == "inimigo":
+                asset = "inimigo_horda_morrer"
+                ancora = "centro"
+                escala = 1.0
+            elif tipo == "errante":
+                asset = "inimigo_errante_morrer"
+                ancora = "centro"
+                escala = 1.0
+            else:
+                asset = "efeito_poeira_construcao"
+                ancora = "centro"
+                escala = 0.55
+            self._adicionar_efeito(
+                asset,
+                dados["x"],
+                dados["y"],
+                escala=escala,
+                fps=10,
+                ancora=ancora,
+            )
+
+    def _adicionar_efeito(
+        self,
+        asset_id: str,
+        x: float,
+        y: float,
+        escala: float = 1.0,
+        fps: float = 10.0,
+        ancora: str = "centro",
+    ) -> None:
+        entrada = self.assets.entrada(asset_id)
+        if entrada is None:
+            return
+        frames = max(1, int(entrada.get("frames", 1)))
+        self._efeitos.append(
+            {
+                "asset": asset_id,
+                "x": x,
+                "y": y,
+                "tempo": 0.0,
+                "duracao": max(0.2, frames / max(1.0, fps)),
+                "fps": fps,
+                "escala": escala,
+                "ancora": ancora,
+            }
+        )
+
+    def _atualizar_efeitos(self, dt: float) -> None:
+        vivos = []
+        for efeito in self._efeitos:
+            efeito["tempo"] += dt
+            if efeito["tempo"] < efeito["duracao"]:
+                vivos.append(efeito)
+        self._efeitos = vivos
+
+    def _desenhar_efeitos(self) -> None:
+        for efeito in self._efeitos:
+            asset_id = efeito["asset"]
+            largura = self.assets.largura_frame(asset_id) * efeito["escala"]
+            altura = self.assets.altura(asset_id) * efeito["escala"]
+            self.assets.desenhar_animacao(
+                asset_id,
+                efeito["x"],
+                efeito["y"],
+                largura=largura,
+                altura=altura,
+                ancora=efeito["ancora"],
+                fps=efeito["fps"],
+                tempo=efeito["tempo"],
+            )
+
+    def _mostrar_banner(self, nome: str) -> None:
+        if not self.assets.tem(f"banner_{nome}"):
+            return
+        self._banner_evento = (nome, 3.2)
+
+    def _atualizar_banner(self, dt: float) -> None:
+        if self._banner_evento is None:
+            return
+        nome, tempo = self._banner_evento
+        tempo -= dt
+        self._banner_evento = (nome, tempo) if tempo > 0 else None
+
+    def _desenhar_banner(self) -> None:
+        if self._banner_evento is None:
+            return
+        nome, tempo = self._banner_evento
+        alpha = int(255 * min(1.0, tempo / 0.45))
+        self.assets.desenhar(
+            f"banner_{nome}",
+            LARGURA / 2,
+            ALTURA - 128,
+            320,
+            96,
+            ancora="centro",
+            alpha=alpha,
+        )
+
     def _podar_selecao(self) -> None:
         self.cidadaos_sel = [
             c for c in self.cidadaos_sel if any(c is vivo for vivo in self.mundo.cidadaos)
@@ -470,6 +653,12 @@ class Jogo(arcade.Window):
             self.caravana_sel = None
 
     def _atualizar_avisos(self) -> None:
+        if self.reino.dias_sem_comida > self._fome_visto:
+            self._mostrar_banner("fome")
+        self._fome_visto = self.reino.dias_sem_comida
+        if self.reino.mercador_dias > 0 and self._mercador_visto <= 0:
+            self._mostrar_banner("mercador")
+        self._mercador_visto = self.reino.mercador_dias
         combate = self.reino.ultimo_combate
         if combate is not None and id(combate) != self._combate_visto:
             self._combate_visto = id(combate)
@@ -491,6 +680,11 @@ class Jogo(arcade.Window):
                 texto_combate = f"{alvo} foi destruído durante o ataque!"
                 cor_combate = COR_VERMELHO
             self._mostrar_toast(texto_combate, cor_combate)
+            if combate.get("vitoria", True):
+                x, y = self.mapa.centro_mundo(CASTELO_ID)
+                self._adicionar_efeito(
+                    "efeito_moedas", x, y - 80, escala=1.0, fps=8
+                )
 
         if self.reino.aviso_ataque and not self._aviso_visto:
             self._mostrar_toast(
@@ -501,6 +695,7 @@ class Jogo(arcade.Window):
         self._aviso_visto = self.reino.aviso_ataque
 
         if self.mundo.raid_ativo and not self._raid_visto:
+            self._mostrar_banner("ataque")
             if self.mundo.raid_posto_id is not None:
                 self._mostrar_toast(
                     f"Horda ataca o Posto #{self.mundo.raid_posto_id}! "
@@ -557,6 +752,10 @@ class Jogo(arcade.Window):
         rotulo.draw()
 
     def painel(self, x, y, largura, altura, cor=COR_PAINEL, borda=COR_BORDA) -> None:
+        if self.assets.ativo and self.assets.desenhar_9slice(
+            "painel_9slice", x, y, largura, altura, margem=12
+        ):
+            return
         arcade.draw_lbwh_rectangle_filled(x, y, largura, altura, cor)
         arcade.draw_lbwh_rectangle_outline(x, y, largura, altura, borda, 1)
 
@@ -1342,6 +1541,10 @@ class Jogo(arcade.Window):
                 f"Castelo agora é nível {self.reino.nivel_castelo}.",
                 COR_VERDE,
             )
+            x, y = self.mapa.centro_mundo(CASTELO_ID)
+            self._adicionar_efeito(
+                "efeito_faisca_upgrade", x, y, escala=1.6, fps=10
+            )
             self._salvar()
 
     def _alternar_recolher(self) -> None:
@@ -1554,6 +1757,11 @@ class Jogo(arcade.Window):
             f"agora está no nível {construcao.nivel}.",
             COR_VERDE,
         )
+        if id_instancia in self.mapa.posicoes:
+            x, y = self.mapa.centro_mundo(id_instancia)
+            self._adicionar_efeito(
+                "efeito_faisca_upgrade", x, y, escala=1.0, fps=10
+            )
         self._salvar()
 
     def _iniciar_mover(self, id_instancia: int) -> None:
@@ -1637,6 +1845,10 @@ class Jogo(arcade.Window):
             )
             self._cancelar_modo()
             self.predio_sel = id_movendo
+            x, y = self.mapa.centro_mundo(id_movendo)
+            self._adicionar_efeito(
+                "efeito_poeira_construcao", x, y, escala=1.0, fps=10
+            )
             self._mostrar_toast(
                 f"{NOMES_CONSTRUCOES[tipo]} #{id_movendo} movida.",
                 COR_VERDE,
@@ -1669,6 +1881,13 @@ class Jogo(arcade.Window):
         self.soldados_sel = []
         self.arvore_sel = None
         self.rocha_sel = None
+        x, y = self.mapa.centro_mundo(id_instancia)
+        self._adicionar_efeito(
+            "predio_construcao", x, y, escala=1.0, fps=8, ancora="base"
+        )
+        self._adicionar_efeito(
+            "efeito_poeira_construcao", x, y, escala=1.0, fps=10
+        )
         self._mostrar_toast(
             f"{NOMES_CONSTRUCOES[tipo]} construída (#{id_instancia}).",
             COR_VERDE,
@@ -1823,6 +2042,7 @@ class Jogo(arcade.Window):
         self._desenhar_minimapa()
         self._desenhar_indicador_horda()
         self._desenhar_topo()
+        self._desenhar_banner()
         if self.detalhe_aberto:
             self._desenhar_detalhe()
         if self.obras_aberto:
@@ -1855,6 +2075,12 @@ class Jogo(arcade.Window):
             self._desenhar_derrota()
 
         self._desenhar_botoes()
+        if self._cursor_custom:
+            mx, my = self.mouse
+            if 0 <= mx <= LARGURA and 0 <= my <= ALTURA:
+                self.assets.desenhar(
+                    "cursor", mx, my, 32, 32, ancora="topo-esquerda"
+                )
 
     # ------------------------------------------------------------------
     # Mundo
@@ -1869,6 +2095,56 @@ class Jogo(arcade.Window):
             pos.y - meia_h,
             pos.y + meia_h,
         )
+
+    def _desenhar_asset_base_conteudo(
+        self, asset_id: str, centro_x: float, base_y: float, alpha: int = 255
+    ) -> bool:
+        if not self.assets.tem(asset_id):
+            return False
+        imagem_largura = self.assets.largura_frame(asset_id)
+        imagem_altura = self.assets.altura(asset_id)
+        desloc_x, desloc_y, largura, _altura = self.assets.caixa_conteudo(asset_id)
+        esquerda = centro_x - largura / 2 - desloc_x
+        baixo = base_y - desloc_y
+        return self.assets.desenhar(
+            asset_id,
+            esquerda + imagem_largura / 2,
+            baixo,
+            imagem_largura,
+            imagem_altura,
+            ancora="base",
+            alpha=alpha,
+        )
+
+    def _desenhar_terreno_assets(self) -> None:
+        esquerda, direita, baixo, cima = self._limites_visiveis()
+        col0 = max(0, int(esquerda // TILE) - 1)
+        col1 = min(COLUNAS, int(direita // TILE) + 2)
+        row0 = max(0, int(baixo // TILE) - 1)
+        row1 = min(LINHAS, int(cima // TILE) + 2)
+        frame_agua = int(self._tempo_anim * 4.0) % 4
+        for row in range(row0, row1):
+            for col in range(col0, col1):
+                tipo = self.mapa.tiles[row][col]
+                variacao = (col * 7 + row * 13) % 3
+                if tipo == AGUA:
+                    asset_id = f"tile_agua_{frame_agua + 1}"
+                elif tipo in (TERRA, ESTRADA):
+                    asset_id = f"tile_terra_{(col + row) % 2 + 1}"
+                elif tipo == FLORESTA:
+                    asset_id = f"tile_floresta_{variacao + 1}"
+                elif tipo == ROCHA:
+                    asset_id = f"tile_rocha_{(col + row) % 2 + 1}"
+                else:
+                    asset_id = f"tile_grama_{variacao + 1}"
+                self.assets.desenhar(
+                    asset_id,
+                    col * TILE + TILE / 2,
+                    row * TILE + TILE / 2,
+                    TILE,
+                    TILE,
+                    ancora="centro",
+                )
 
     def _criar_chunk_terreno(self, cx: int, cy: int) -> ShapeElementList:
         formas = ShapeElementList()
@@ -1954,29 +2230,53 @@ class Jogo(arcade.Window):
         return formas
 
     def _desenhar_mundo(self) -> None:
-        esquerda, direita, baixo, cima = self._limites_visiveis()
-        for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
-            if chunk not in self._terreno_chunks:
-                self._terreno_chunks[chunk] = self._criar_chunk_terreno(*chunk)
-            self._terreno_chunks[chunk].draw()
+        if self.assets.ativo:
+            self._desenhar_terreno_assets()
+        else:
+            esquerda, direita, baixo, cima = self._limites_visiveis()
+            for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
+                if chunk not in self._terreno_chunks:
+                    self._terreno_chunks[chunk] = self._criar_chunk_terreno(*chunk)
+                self._terreno_chunks[chunk].draw()
         arcade.draw_lbwh_rectangle_outline(
             0, 0, LARGURA_MUNDO, ALTURA_MUNDO, (10, 12, 16), 4
         )
         self._desenhar_arvores()
         self._desenhar_rochas()
-        self._desenhar_predios()
-        self._desenhar_unidades()
+        if self.assets.ativo:
+            self._desenhar_unidades()
+            self._desenhar_caravanas()
+            self._desenhar_predios()
+        else:
+            self._desenhar_predios()
+            self._desenhar_unidades()
+            self._desenhar_caravanas()
         self._desenhar_tiros_postos()
-        self._desenhar_caravanas()
+        self._desenhar_efeitos()
         self._desenhar_fantasma()
         self._desenhar_marcador()
 
     def _desenhar_arvores(self) -> None:
         esquerda, direita, baixo, cima = self._limites_visiveis()
-        for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
-            if chunk not in self._arvores_chunks:
-                self._arvores_chunks[chunk] = self._criar_chunk_arvores(*chunk)
-            self._arvores_chunks[chunk].draw()
+        if self.assets.ativo:
+            for (col, row), arvore in self.mundo.arvores.items():
+                x = col * TILE
+                y = row * TILE
+                if x + TILE < esquerda or x > direita or y + TILE < baixo or y > cima:
+                    continue
+                if arvore.estado == "adulta":
+                    variacao = (col * 5 + row * 11) % 3
+                    asset_id = f"arvore_{variacao + 1}"
+                else:
+                    asset_id = "arvore_toco"
+                self._desenhar_asset_base_conteudo(
+                    asset_id, x + TILE / 2, y
+                )
+        else:
+            for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
+                if chunk not in self._arvores_chunks:
+                    self._arvores_chunks[chunk] = self._criar_chunk_arvores(*chunk)
+                self._arvores_chunks[chunk].draw()
         for (col, row), arvore in self.mundo.arvores.items():
             if arvore.estado != "adulta":
                 continue
@@ -2022,10 +2322,25 @@ class Jogo(arcade.Window):
 
     def _desenhar_rochas(self) -> None:
         esquerda, direita, baixo, cima = self._limites_visiveis()
-        for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
-            if chunk not in self._rochas_chunks:
-                self._rochas_chunks[chunk] = self._criar_chunk_rochas(*chunk)
-            self._rochas_chunks[chunk].draw()
+        if self.assets.ativo:
+            for (col, row), rocha in self.mundo.rochas.items():
+                x = col * TILE
+                y = row * TILE
+                if x + TILE < esquerda or x > direita or y + TILE < baixo or y > cima:
+                    continue
+                if rocha.estado == "adulta":
+                    variacao = (col * 13 + row * 7) % 2
+                    asset_id = f"rocha_{variacao + 1}"
+                else:
+                    asset_id = "rocha_esgotada"
+                self._desenhar_asset_base_conteudo(
+                    asset_id, x + TILE / 2, y
+                )
+        else:
+            for chunk in self.mapa.chunks_visiveis(esquerda, direita, baixo, cima):
+                if chunk not in self._rochas_chunks:
+                    self._rochas_chunks[chunk] = self._criar_chunk_rochas(*chunk)
+                self._rochas_chunks[chunk].draw()
         for (col, row), rocha in self.mundo.rochas.items():
             x = col * TILE + TILE / 2
             y = row * TILE + TILE / 2
@@ -2038,8 +2353,33 @@ class Jogo(arcade.Window):
             if self.rocha_sel == (col, row):
                 arcade.draw_circle_outline(x, y, 30, (240, 204, 90), 3)
 
+    def _desenhar_caravana_asset(self, caravana) -> bool:
+        acao = "andar" if caravana.caminho else "idle"
+        asset_id = f"caravana_{acao}"
+        if not self.assets.tem(asset_id):
+            return False
+        fps = 10.0 if acao == "andar" else 5.0
+        self.assets.desenhar_animacao(
+            asset_id,
+            caravana.x,
+            caravana.y - 18,
+            64,
+            48,
+            ancora="base",
+            fps=fps,
+            tempo=self._tempo_anim,
+            fase=caravana.id * 0.2,
+        )
+        if self.caravana_sel is caravana:
+            arcade.draw_circle_outline(
+                caravana.x, caravana.y, 26, (240, 204, 90), 3
+            )
+        return True
+
     def _desenhar_caravanas(self) -> None:
         for caravana in self.mundo.caravanas:
+            if self.assets.ativo and self._desenhar_caravana_asset(caravana):
+                continue
             arcade.draw_ellipse_filled(
                 caravana.x, caravana.y - 8, 34, 12, (12, 14, 18, 140)
             )
@@ -2182,12 +2522,20 @@ class Jogo(arcade.Window):
     def _desenhar_minimapa(self) -> None:
         if not self._minimapa_visivel():
             return
-        arcade.draw_lbwh_rectangle_filled(
-            MINI_X, MINI_Y, MINI_W, MINI_H, (16, 20, 28, 235)
-        )
-        arcade.draw_lbwh_rectangle_outline(
-            MINI_X, MINI_Y, MINI_W, MINI_H, COR_BORDA, 1
-        )
+        if not (self.assets.ativo and self.assets.desenhar(
+            "minimapa_moldura",
+            MINI_X + MINI_W / 2,
+            MINI_Y + MINI_H / 2,
+            MINI_W,
+            MINI_H,
+            ancora="centro",
+        )):
+            arcade.draw_lbwh_rectangle_filled(
+                MINI_X, MINI_Y, MINI_W, MINI_H, (16, 20, 28, 235)
+            )
+            arcade.draw_lbwh_rectangle_outline(
+                MINI_X, MINI_Y, MINI_W, MINI_H, COR_BORDA, 1
+            )
         largura_chunk = MINI_W * TAMANHO_CHUNK / COLUNAS
         altura_chunk = MINI_H * TAMANHO_CHUNK / LINHAS
         for cx in range(COLUNAS // TAMANHO_CHUNK):
@@ -2224,7 +2572,10 @@ class Jogo(arcade.Window):
             if (col // TAMANHO_CHUNK, row // TAMANHO_CHUNK) in self.mundo.fog:
                 continue
             mx, my = self._ponto_minimapa(inimigo.x, inimigo.y)
-            arcade.draw_circle_filled(mx, my, 2, (226, 92, 92))
+            if not self.assets.desenhar(
+                "minimapa_marcador_ataque", mx, my, 8, 8, ancora="centro"
+            ):
+                arcade.draw_circle_filled(mx, my, 2, (226, 92, 92))
         for inimigo in self.mundo.errantes:
             col, row = self.mapa.tile_do_mundo(inimigo.x, inimigo.y)
             if (col // TAMANHO_CHUNK, row // TAMANHO_CHUNK) in self.mundo.fog:
@@ -2302,10 +2653,13 @@ class Jogo(arcade.Window):
             taxa = producao.get(recurso, 0.0)
             if taxa <= 0 and recurso in ("troncos",):
                 pass
+            usou_icone = self.assets.ativo and self.assets.desenhar(
+                f"icone_{recurso}", ECON_X + 17, y, 12, 12, ancora="centro"
+            )
             self.texto(
                 f"econ_prod_{recurso}",
                 f"{NOMES_RECURSOS[recurso]}: +{fmt(taxa, 2)}/dia",
-                ECON_X + 20,
+                ECON_X + (30 if usou_icone else 20),
                 y,
                 9,
                 COR_TEXTO if taxa > 0 else COR_TEXTO_SUAVE,
@@ -2421,11 +2775,90 @@ class Jogo(arcade.Window):
             else:
                 self._desenhar_predio(id_instancia)
 
+    def _desenhar_predio_assets(self, id_instancia: int, construcao) -> bool:
+        tipo = construcao.tipo
+        nivel = min(3, max(1, construcao.nivel))
+        asset_id = f"predio_{tipo}_nivel_{nivel}"
+        if not self.assets.tem(asset_id):
+            return False
+        x, y, largura, altura = self.mapa.rect_mundo(id_instancia)
+        centro_x = x + largura / 2
+        imagem_largura = self.assets.largura_frame(asset_id)
+        imagem_altura = self.assets.altura(asset_id)
+        desloc_x, desloc_y, largura_sprite, altura_sprite = self.assets.caixa_conteudo(
+            asset_id
+        )
+        imagem_esquerda = centro_x - largura_sprite / 2 - desloc_x
+        imagem_baixo = y - desloc_y
+        if not self.assets.desenhar(
+            asset_id,
+            imagem_esquerda + imagem_largura / 2,
+            imagem_baixo,
+            imagem_largura,
+            imagem_altura,
+            ancora="base",
+        ):
+            return False
+        if construcao.hp_max > 0 and construcao.hp < construcao.hp_max:
+            self.assets.desenhar(
+                "predio_dano",
+                centro_x,
+                y,
+                largura_sprite,
+                altura_sprite,
+                ancora="base",
+                alpha=125,
+            )
+        if self.predio_sel == id_instancia:
+            arcade.draw_lbwh_rectangle_outline(
+                x - 2, y - 2, largura + 4, altura + 4, (240, 204, 90), 3
+            )
+        vagas = self.reino.vagas_instancia(id_instancia)
+        if vagas > 0:
+            self.texto(
+                f"trab_{id_instancia}",
+                f"{construcao.trabalhadores}/{vagas}",
+                centro_x,
+                y + altura_sprite + 10,
+                8.5,
+                (210, 220, 235),
+                anchor_x="center",
+            )
+        barras: list[tuple[float, tuple[int, int, int]]] = []
+        taxas = self.reino.taxas_instancia(construcao)
+        for recurso, progresso in construcao.progressos.items():
+            if taxas.get(recurso, 0.0) > 0 or progresso > 0:
+                barras.append((progresso, CORES_RECURSOS.get(recurso, (200, 200, 200))))
+        if tipo == "madeireira" and "madeira" in construcao.progressos:
+            barras = [(construcao.progressos["madeira"], CORES_RECURSOS["madeira"])]
+        if barras and construcao.trabalhadores > 0:
+            base_y = y + altura_sprite + 22
+            for indice, (fracao, cor_barra) in enumerate(barras[:3]):
+                self._barra_hp(
+                    centro_x,
+                    base_y + indice * 7,
+                    max(24, largura_sprite - 12),
+                    max(0.0, min(1.0, fracao)),
+                    cor_barra,
+                )
+        if construcao.hp_max > 0 and (
+            construcao.hp < construcao.hp_max or self.predio_sel == id_instancia
+        ):
+            self._barra_hp_asset(
+                centro_x,
+                y + altura_sprite + 22 + max(1, min(3, len(barras))) * 7 + 2,
+                max(24, largura_sprite - 12),
+                construcao.hp / max(1.0, construcao.hp_max),
+            )
+        return True
+
     def _desenhar_predio(self, id_instancia: int) -> None:
         if id_instancia not in self.mapa.posicoes:
             return
         construcao = self.reino.construcoes.get(id_instancia)
         if construcao is None or construcao.nivel <= 0:
+            return
+        if self.assets.ativo and self._desenhar_predio_assets(id_instancia, construcao):
             return
         tipo = construcao.tipo
         x, y, largura, altura = self.mapa.rect_mundo(id_instancia)
@@ -2585,7 +3018,77 @@ class Jogo(arcade.Window):
                 x - 2, y - 2, largura + 4, altura + 4, (240, 204, 90), 3
             )
 
+    def _desenhar_castelo_assets(self) -> bool:
+        x, y, largura, altura = self.mapa.rect_mundo(CASTELO_ID)
+        hp = max(0.0, self.reino.hp_castelo)
+        hp_max = self.reino.hp_castelo_max
+        proporcao = hp / hp_max if hp_max else 0.0
+        if proporcao <= 0:
+            asset_id = "castelo_dano_ruinas"
+        elif proporcao < 0.3:
+            asset_id = "castelo_dano_critico"
+        elif proporcao < 0.55:
+            asset_id = "castelo_dano_medio"
+        elif proporcao < 0.8:
+            asset_id = "castelo_dano_leve"
+        else:
+            asset_id = f"castelo_nivel_{min(5, max(1, self.reino.nivel_castelo))}"
+        if not self.assets.tem(asset_id):
+            return False
+        centro_x = x + largura / 2
+        imagem_largura = self.assets.largura_frame(asset_id)
+        imagem_altura = self.assets.altura(asset_id)
+        desloc_x, desloc_y, largura_sprite, altura_sprite = self.assets.caixa_conteudo(
+            asset_id
+        )
+        imagem_esquerda = centro_x - largura_sprite / 2 - desloc_x
+        imagem_baixo = y - desloc_y
+        if not self.assets.desenhar(
+            asset_id,
+            imagem_esquerda + imagem_largura / 2,
+            imagem_baixo,
+            imagem_largura,
+            imagem_altura,
+            ancora="base",
+        ):
+            return False
+        if self.predio_sel == CASTELO_ID:
+            arcade.draw_lbwh_rectangle_outline(
+                x - 2, y - 2, largura + 4, altura + 4, (240, 204, 90), 3
+            )
+        barra_y = y + altura_sprite + 10
+        self.assets.desenhar(
+            "hp_castelo_fundo", centro_x, barra_y + 5, largura, 10, ancora="centro"
+        )
+        if proporcao > 0:
+            cor_barra = (
+                COR_VERDE
+                if proporcao > 0.6
+                else COR_DOURADO
+                if proporcao > 0.3
+                else COR_VERMELHO
+            )
+            arcade.draw_lbwh_rectangle_filled(
+                x,
+                barra_y,
+                max(1.0, largura * proporcao),
+                10,
+                cor_barra,
+            )
+        self.texto(
+            "castelo_hp",
+            f"{fmt(hp)}/{fmt(hp_max)}",
+            centro_x,
+            barra_y + 22,
+            9,
+            (230, 232, 238),
+            anchor_x="center",
+        )
+        return True
+
     def _desenhar_castelo(self) -> None:
+        if self.assets.ativo and self._desenhar_castelo_assets():
+            return
         x, y, largura, altura = self.mapa.rect_mundo(CASTELO_ID)
         arcade.draw_lbwh_rectangle_filled(
             x + 5, y + 5, largura - 10, altura - 10, (108, 98, 128)
@@ -2643,8 +3146,162 @@ class Jogo(arcade.Window):
             anchor_x="center",
         )
 
+    def _acao_cidadao(self, cidadao: Cidadao) -> str:
+        estado = cidadao.estado
+        if estado in (
+            "indo_arvore", "indo_rocha", "indo_pesca", "indo_entrega",
+            "indo_entrega_pedra", "indo_predio", "indo_descanso",
+            "indo_dormir", "indo_recolher", "indo_mover",
+        ):
+            acao = "andar"
+        elif estado == "cortando":
+            acao = "cortar"
+        elif estado == "minerando":
+            acao = "minerar" if cidadao.profissao == "pedreiro" else "trabalhar"
+        elif estado == "pescando":
+            acao = "pescar"
+        elif estado == "trabalhando":
+            acao = "trabalhar"
+        else:
+            acao = "idle"
+        if acao == "andar" and (cidadao.troncos > 0 or cidadao.pedras > 0):
+            acao = "carregar"
+        return acao
+
+    def _asset_cidadao(self, cidadao: Cidadao) -> tuple[str, str]:
+        base = "rei" if cidadao.rei else cidadao.profissao
+        acao = self._acao_cidadao(cidadao)
+        for candidata in (acao, "trabalhar", "andar", "idle"):
+            asset_id = f"cidadao_{base}_{candidata}"
+            if self.assets.tem(asset_id):
+                return asset_id, candidata
+        return "", ""
+
+    def _desenhar_cidadao_asset(self, cidadao: Cidadao) -> bool:
+        asset_id, acao = self._asset_cidadao(cidadao)
+        if not asset_id:
+            return False
+        fps = {
+            "idle": 5.0,
+            "andar": 10.0,
+            "cortar": 11.0,
+            "trabalhar": 8.0,
+            "minerar": 10.0,
+            "pescar": 8.0,
+            "carregar": 6.0,
+        }.get(acao, 8.0)
+        if any(cidadao is c for c in self.cidadaos_sel):
+            arcade.draw_circle_outline(
+                cidadao.x, cidadao.y, 15, (240, 204, 90), 3
+            )
+        self.assets.desenhar_animacao(
+            asset_id,
+            cidadao.x,
+            cidadao.y - 6,
+            32,
+            32,
+            ancora="base",
+            fps=fps,
+            tempo=self._tempo_anim,
+            fase=cidadao.id * 0.17,
+        )
+        if cidadao.hp < cidadao.hp_max:
+            self._barra_hp_asset(
+                cidadao.x,
+                cidadao.y + 26,
+                32,
+                cidadao.hp / max(1.0, cidadao.hp_max),
+            )
+        return True
+
+    def _acao_soldado(self, soldado: Soldado) -> str:
+        if soldado.caminho:
+            return "andar"
+        if soldado.alvo is not None:
+            return CLASSES_TROPA.get(soldado.classe, CLASSES_TROPA["soldado"]).get(
+                "base", "soldado"
+            )
+        return "idle"
+
+    def _desenhar_soldado_asset(self, soldado: Soldado) -> bool:
+        base = CLASSES_TROPA.get(soldado.classe, CLASSES_TROPA["soldado"]).get(
+            "base", "soldado"
+        )
+        acao = self._acao_soldado(soldado)
+        if acao in ("soldado", "arqueiro", "mago", "curandeiro"):
+            acao = {
+                "soldado": "atacar",
+                "arqueiro": "atacar",
+                "mago": "conjurar",
+                "curandeiro": "curar",
+            }[acao]
+        asset_id = f"tropa_{soldado.classe}_{acao}"
+        if not self.assets.tem(asset_id):
+            asset_id = f"tropa_{soldado.classe}_idle"
+        if not self.assets.tem(asset_id):
+            return False
+        fps = 5.0 if acao == "idle" else 11.0 if acao == "andar" else 13.0
+        if any(soldado is s for s in self.soldados_sel):
+            arcade.draw_circle_outline(
+                soldado.x, soldado.y, 20, (240, 204, 90), 3
+            )
+        self.assets.desenhar_animacao(
+            asset_id,
+            soldado.x,
+            soldado.y - 8,
+            48,
+            48,
+            ancora="base",
+            fps=fps,
+            tempo=self._tempo_anim,
+            fase=soldado.id * 0.19,
+        )
+        self._barra_hp_asset(
+            soldado.x,
+            soldado.y + 42,
+            32,
+            soldado.hp / max(1.0, soldado.hp_max),
+        )
+        return True
+
+    def _desenhar_inimigo_asset(self, inimigo, nome: str, altura_barra: float) -> bool:
+        if inimigo.caminho:
+            acao = "andar"
+        elif (
+            inimigo.alvo_soldado is not None
+            or inimigo.alvo_cidadao is not None
+            or inimigo.alvo_estrutura is not None
+        ):
+            acao = "atacar"
+        else:
+            acao = "idle"
+        asset_id = f"inimigo_{nome}_{acao}"
+        if not self.assets.tem(asset_id):
+            return False
+        fps = 5.0 if acao == "idle" else 10.0 if acao == "andar" else 12.0
+        self.assets.desenhar_animacao(
+            asset_id,
+            inimigo.x,
+            inimigo.y - 8,
+            48,
+            48,
+            ancora="base",
+            fps=fps,
+            tempo=self._tempo_anim,
+            fase=inimigo.id * 0.23,
+        )
+        self._barra_hp_asset(
+            inimigo.x,
+            inimigo.y + altura_barra,
+            32,
+            inimigo.hp / max(1.0, inimigo.hp_max),
+        )
+        return True
+
     def _desenhar_unidades(self) -> None:
         for cidadao in self.mundo.cidadaos:
+            if self.assets.ativo and self._desenhar_cidadao_asset(cidadao):
+                continue
             cor = CORES_PROFISSAO.get(cidadao.profissao, (200, 200, 200))
             if cidadao.rei:
                 cor = (240, 204, 90)
@@ -2679,6 +3336,8 @@ class Jogo(arcade.Window):
                 )
 
         for soldado in self.mundo.soldados:
+            if self.assets.ativo and self._desenhar_soldado_asset(soldado):
+                continue
             cor_soldado = CLASSES_TROPA.get(
                 soldado.classe, {"cor": (90, 150, 220)}
             )["cor"]
@@ -2703,6 +3362,15 @@ class Jogo(arcade.Window):
                 )
 
         for inimigo in self.mundo.inimigos:
+            if self.assets.ativo and self._desenhar_inimigo_asset(inimigo, "horda", 42):
+                if any(
+                    s.ordem_ataque and s.alvo is inimigo
+                    for s in self.mundo.soldados
+                ):
+                    arcade.draw_circle_outline(
+                        inimigo.x, inimigo.y, 20, (240, 140, 80), 2
+                    )
+                continue
             arcade.draw_ellipse_filled(
                 inimigo.x, inimigo.y - 8, 26, 11, (12, 14, 18, 140)
             )
@@ -2724,6 +3392,8 @@ class Jogo(arcade.Window):
                 )
 
         for inimigo in self.mundo.errantes:
+            if self.assets.ativo and self._desenhar_inimigo_asset(inimigo, "errante", 40):
+                continue
             arcade.draw_ellipse_filled(
                 inimigo.x, inimigo.y - 8, 26, 11, (12, 14, 18, 140)
             )
@@ -2749,9 +3419,39 @@ class Jogo(arcade.Window):
                 (246, 220, 120, 210),
                 2,
             )
-            arcade.draw_circle_filled(
-                tiro["x2"], tiro["y2"], 3, (250, 236, 170)
+            if not self.assets.desenhar_animacao(
+                "efeito_tiro_posto",
+                tiro["x2"],
+                tiro["y2"],
+                28,
+                28,
+                ancora="centro",
+                fps=20,
+                tempo=self._tempo_anim,
+                fase=tiro.get("tempo", 0.0) * 10,
+            ):
+                arcade.draw_circle_filled(
+                    tiro["x2"], tiro["y2"], 3, (250, 236, 170)
+                )
+
+    def _barra_hp_asset(self, x: float, y: float, largura: float, proporcao: float) -> bool:
+        if not self.assets.ativo:
+            return False
+        proporcao = limitar(proporcao, 0.0, 1.0)
+        if not self.assets.desenhar(
+            "hp_unidade_fundo", x, y + 2, largura, 4, ancora="centro"
+        ):
+            return False
+        if proporcao > 0:
+            self.assets.desenhar(
+                "hp_unidade_preenchimento",
+                x - largura / 2 + max(1.0, largura * proporcao) / 2,
+                y + 2,
+                max(1.0, largura * proporcao),
+                4,
+                ancora="centro",
             )
+        return True
 
     def _barra_hp(self, x, y, largura, proporcao, cor) -> None:
         proporcao = limitar(proporcao, 0.0, 1.0)
@@ -2800,18 +3500,24 @@ class Jogo(arcade.Window):
         else:
             cor_preenchimento = (220, 80, 80, 90)
             cor_borda = (240, 110, 110)
-        arcade.draw_lbwh_rectangle_filled(x, y, w, h, cor_preenchimento)
-        arcade.draw_lbwh_rectangle_outline(x, y, w, h, cor_borda, 2)
-        self.texto(
-            "fantasma_nome",
-            SIGLAS.get(nome, nome[:3]),
-            x + w / 2,
-            y + h / 2,
-            11,
-            (240, 242, 246),
-            anchor_x="center",
-            negrito=True,
+        asset_id = f"predio_{nome}_nivel_1"
+        usou_asset = self.assets.ativo and self._desenhar_asset_base_conteudo(
+            asset_id, x + w / 2, y, alpha=150
         )
+        if not usou_asset:
+            arcade.draw_lbwh_rectangle_filled(x, y, w, h, cor_preenchimento)
+        arcade.draw_lbwh_rectangle_outline(x, y, w, h, cor_borda, 2)
+        if not usou_asset:
+            self.texto(
+                "fantasma_nome",
+                SIGLAS.get(nome, nome[:3]),
+                x + w / 2,
+                y + h / 2,
+                11,
+                (240, 242, 246),
+                anchor_x="center",
+                negrito=True,
+            )
         custo = self.reino.custo_nova_instancia(nome)
         texto_custo = "  ".join(
             f"{ABREVIACOES[r]} {fmt(q)}" for r, q in custo.items()
@@ -2861,10 +3567,23 @@ class Jogo(arcade.Window):
         else:
             ataque, cor = f"Ataque: dia {proximo}", COR_TEXTO_SUAVE
         self.texto("ataque_topo", ataque, 12, TOPO_Y + 10, 8.5, cor)
+        if self.mundo.raid_ativo or self.reino.aviso_ataque:
+            self.assets.desenhar(
+                "alerta_ataque", 92, TOPO_Y + 22, 16, 16, ancora="centro"
+            )
+        if self.reino.dias_sem_comida > 0:
+            self.assets.desenhar(
+                "alerta_fome", 72, TOPO_Y + 22, 16, 16, ancora="centro"
+            )
 
         x = 105
         for recurso in RECURSOS_TOPO:
-            arcade.draw_circle_filled(x + 4, TOPO_Y + 22, 4, CORES_RECURSOS[recurso])
+            if not (self.assets.ativo and self.assets.desenhar(
+                f"icone_{recurso}", x + 4, TOPO_Y + 22, 14, 14, ancora="centro"
+            )):
+                arcade.draw_circle_filled(
+                    x + 4, TOPO_Y + 22, 4, CORES_RECURSOS[recurso]
+                )
             self.texto(
                 f"topo_nome_{recurso}",
                 ABREVIACOES[recurso],
@@ -2884,6 +3603,9 @@ class Jogo(arcade.Window):
             )
             x += 66
 
+        self.assets.desenhar(
+            "icone_populacao", 562, TOPO_Y + 22, 14, 14, ancora="centro"
+        )
         self.texto("topo_pop_lbl", "Pop", 574, TOPO_Y + 29, 7.5, COR_TEXTO_SUAVE)
         self.texto(
             "topo_pop_val",
@@ -2893,6 +3615,9 @@ class Jogo(arcade.Window):
             10,
             COR_TEXTO,
             negrito=True,
+        )
+        self.assets.desenhar(
+            "icone_soldados", 622, TOPO_Y + 22, 14, 14, ancora="centro"
         )
         self.texto("topo_sold_lbl", "Tropas", 634, TOPO_Y + 29, 7.5, COR_TEXTO_SUAVE)
         self.texto(
@@ -2929,7 +3654,12 @@ class Jogo(arcade.Window):
         producao = self.reino.taxas_producao()
         y = DET_Y + DET_H - 48
         for recurso in RECURSOS:
-            arcade.draw_circle_filled(DET_X + 20, y, 4, CORES_RECURSOS[recurso])
+            if not (self.assets.ativo and self.assets.desenhar(
+                f"icone_{recurso}", DET_X + 20, y, 12, 12, ancora="centro"
+            )):
+                arcade.draw_circle_filled(
+                    DET_X + 20, y, 4, CORES_RECURSOS[recurso]
+                )
             self.texto(
                 f"det_nome_{recurso}",
                 NOMES_RECURSOS[recurso],
@@ -3122,10 +3852,19 @@ class Jogo(arcade.Window):
                 OBRAS_X + 4, topo - 37, OBRAS_W - 8, 35, cor_fundo
             )
             cor_nome = COR_TEXTO if quantidade > 0 else COR_TEXTO_SUAVE
+            tem_icone = self.assets.ativo and self.assets.desenhar(
+                f"predio_{tipo}_icone",
+                OBRAS_X + 18,
+                topo - 18,
+                24,
+                24,
+                ancora="centro",
+            )
+            texto_x = OBRAS_X + (34 if tem_icone else 10)
             self.texto(
                 f"obras_nome_{tipo}",
                 NOMES_CONSTRUCOES[tipo],
-                OBRAS_X + 10,
+                texto_x,
                 topo - 8,
                 9,
                 cor_nome,
@@ -3145,7 +3884,7 @@ class Jogo(arcade.Window):
             self.texto(
                 f"obras_info_{tipo}",
                 info,
-                OBRAS_X + 10,
+                texto_x,
                 topo - 19,
                 7.2,
                 COR_TEXTO_SUAVE,
@@ -3179,7 +3918,7 @@ class Jogo(arcade.Window):
             self.texto(
                 f"obras_custo_{tipo}",
                 texto_custo,
-                OBRAS_X + 10,
+                texto_x,
                 topo - 29,
                 7.2,
                 cor_custo,
@@ -3877,19 +4616,34 @@ class Jogo(arcade.Window):
             if not botao.habilitado:
                 cor = COR_DESABILITADO
                 cor_texto = (110, 115, 125)
+                estado = "desabilitado"
             else:
                 cor = botao.cor
                 if pressionado:
                     cor = tuple(max(0, c - 30) for c in cor)
+                    estado = "pressionado"
                 elif sobre:
                     cor = tuple(min(255, c + 25) for c in cor)
+                    estado = "hover"
+                else:
+                    estado = "normal"
                 cor_texto = COR_TEXTO
-            arcade.draw_lbwh_rectangle_filled(
-                botao.x, botao.y, botao.largura, botao.altura, cor
+            estilo = "secundario" if botao.cor == COR_CINZA_BOTAO else "primario"
+            usou_asset = self.assets.ativo and self.assets.desenhar(
+                f"botao_{estilo}_{estado}",
+                botao.x + botao.largura / 2,
+                botao.y + botao.altura / 2,
+                botao.largura,
+                botao.altura,
+                ancora="centro",
             )
-            arcade.draw_lbwh_rectangle_outline(
-                botao.x, botao.y, botao.largura, botao.altura, COR_BORDA, 1
-            )
+            if not usou_asset:
+                arcade.draw_lbwh_rectangle_filled(
+                    botao.x, botao.y, botao.largura, botao.altura, cor
+                )
+                arcade.draw_lbwh_rectangle_outline(
+                    botao.x, botao.y, botao.largura, botao.altura, COR_BORDA, 1
+                )
             self.texto(
                 f"botao_{indice}_{botao.tamanho_fonte}",
                 botao.rotulo,
@@ -3903,6 +4657,9 @@ class Jogo(arcade.Window):
 
     def _desenhar_derrota(self) -> None:
         arcade.draw_lbwh_rectangle_filled(0, 0, LARGURA, ALTURA, (0, 0, 0, 200))
+        self.assets.desenhar(
+            "logo", LARGURA / 2, 520, 320, 96, ancora="centro", alpha=235
+        )
         self.texto(
             "derrota_titulo",
             "O REINO CAIU",
